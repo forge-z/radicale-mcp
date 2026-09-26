@@ -2,6 +2,12 @@ name: Test and publish MCP image
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
 
 concurrency:
   group: image-${{ github.ref }}
@@ -48,11 +54,14 @@ jobs:
         run: |
           docker compose config --quiet
           docker compose config --format json | jq -e '
-            .services["radicale-mcp"] |
-            .expose == ["8080"] and .environment.PORT == "8080" and
-            .environment.DAV_URL == "http://radicale:5232/" and
-            ((.ports // []) | length == 0) and
-            ((.volumes // []) | length == 0) and (has("platform") | not)'
+            (.services.radicale.healthcheck.test | length) > 0 and
+            .services["radicale-mcp"].depends_on.radicale.condition == "service_healthy" and
+            .services["radicale-mcp"].expose == ["8080"] and
+            .services["radicale-mcp"].environment.PORT == "8080" and
+            .services["radicale-mcp"].environment.DAV_URL == "http://radicale:5232/" and
+            ((.services["radicale-mcp"].ports // []) | length == 0) and
+            ((.services["radicale-mcp"].volumes // []) | length == 0) and
+            (.services["radicale-mcp"] | has("platform") | not)'
       - name: Build MCP image
         id: build
         run: |

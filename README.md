@@ -1,53 +1,150 @@
 # Radicale MCP
 
-A thin MCP sidecar for an existing Radicale CalDAV/CardDAV server. The MCP image runs only the Python adapter and exposes calendars, tasks, and contacts over Streamable HTTP at `/mcp`. Radicale runs separately and owns its configuration, accounts, collections, and storage. The adapter uses authenticated DAV requests and needs no data volume, local database, or item cache.
+A thin MCP sidecar for an existing [Radicale](https://github.com/Kozea/Radicale) CalDAV/CardDAV server.
 
-## Add MCP to an existing Compose stack
+Radicale remains responsible for users, permissions, collections, storage, CalDAV and CardDAV. `radicale-mcp` only translates MCP tool calls into authenticated DAV requests. It has no database, no storage volume, no cache, and does not import Radicale internals.
 
-Copy only the `radicale-mcp` service from [compose.yaml](compose.yaml) into the existing Compose file and connect it to the same network as Radicale. Keep the existing project/stack name, Radicale service, port, configuration, and volume definitions. The reference file uses `name: radicale`; do not rename an existing deployment to match it.
+## What it exposes
 
-The complete example retains the upstream image `ghcr.io/kozea/radicale:stable`, its `TZ=America/Sao_Paulo`, port `5232:5232`, and the `config:/etc/radicale` and `data:/var/lib/radicale` mounts. The named bind volumes remain `radicale-config` (`./config`) and `radicale-data` (`./data`). The MCP service has no volumes and does not read those directories.
+- Calendars and events: list, search, read, create, update, delete
+- Task lists and VTODO tasks: list, search, read, create, update, complete, delete
+- Address books and contacts: list, search, read, create, update, delete
+- Streamable HTTP MCP endpoint at `/mcp`
+- Public readiness endpoint at `/health`
+- Multiarch container image for `linux/amd64` and `linux/arm64`
 
-Set the credentials of an existing Radicale account and a separate MCP token in the deployment environment or an uncommitted `.env`:
+Image:
+
+```text
+ghcr.io/forge-z/radicale-mcp:latest
+```
+
+## Architecture
+
+```text
+MCP client
+    |
+    | HTTPS + Bearer token
+    v
+radicale-mcp
+    |
+    | CalDAV / CardDAV
+    v
+Radicale
+    |
+    v
+existing Radicale storage
+```
+
+The MCP container never mounts or reads Radicale's data or configuration directories.
+
+## Quick start
+
+If Radicale is already running, add only the MCP sidecar to the same Docker network:
+
+```yaml
+radicale-mcp:
+  image: ghcr.io/forge-z/radicale-mcp:latest
+  pull_policy: always
+  restart: unless-stopped
+  init: true
+
+  environment:
+    DAV_URL: http://radicale:5232/
+    DAV_USERNAME: ${DAV_USERNAME}
+    DAV_PASSWORD: ${DAV_PASSWORD}
+    MCP_TOKEN: ${MCP_TOKEN}
+    MCP_TIMEZONE: ${MCP_TIMEZONE:-UTC}
+    PORT: "8080"
+
+  expose:
+    - "8080"
+
+  read_only: true
+
+  tmpfs:
+    - /tmp:size=16m
+
+  cap_drop:
+    - ALL
+
+  security_opt:
+    - no-new-privileges:true
+```
+
+Example environment:
 
 ```dotenv
-DAV_USERNAME=<existing Radicale username>
-DAV_PASSWORD=<existing Radicale password>
-MCP_TOKEN=<long random token>
+DAV_USERNAME=alice
+DAV_PASSWORD=change-me
+MCP_TOKEN=replace-with-a-long-random-token
+MCP_TIMEZONE=Europe/London
 ```
 
-`DAV_URL` must use the reachable Radicale service name on that network. The example uses `http://radicale:5232/`. Keep Radicale's existing authentication and rights configuration; the MCP adapter uses the same DAV access granted to that account.
-
-Once the configured MCP image tag is available, start only the sidecar:
+Generate a token with:
 
 ```sh
-docker compose up -d --no-deps radicale-mcp
-docker compose ps radicale-mcp
-docker compose exec -T radicale-mcp python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"
+openssl rand -hex 32
 ```
 
-Adding MCP does not require recreating or migrating volumes, changing Radicale configuration, or restarting Radicale. Avoid a stack-wide `up`, `down`, or volume operation for this addition. The example consumes `ghcr.io/forge-z/radicale-mcp:latest`, a multiarch image for `linux/amd64` and `linux/arm64`; Docker selects the native architecture automatically. It is also possible to build the source with that tag in an authorized development environment.
+Expose `radicale-mcp:8080` through your HTTPS reverse proxy and configure the MCP client with:
+
+```text
+https://mcp.example.com/mcp
+Authorization: Bearer <MCP_TOKEN>
+```
+
+Do not expose the MCP endpoint without HTTPS on an untrusted network.
+
+## Complete Compose example
+
+[compose.yaml](compose.yaml) shows Radicale and the sidecar together. It preserves Radicale as the only DAV/storage service and gives each container its own health check.
+
+If you already have a production Radicale deployment, keep your existing Radicale volumes and configuration. Copy the MCP service rather than replacing or migrating the existing storage.
 
 ## Configuration
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `DAV_URL` | Radicale HTTP base URL used by MCP | `http://radicale:5232/` |
-| `DAV_USERNAME` | Existing Radicale user for DAV Basic auth | Required |
-| `DAV_PASSWORD` | Password for that user | Required |
-| `MCP_TOKEN` | Single Bearer token for `/mcp`; startup fails if empty | Required |
-| `MCP_TIMEZONE` | IANA zone for new date-times without an offset | `America/Sao_Paulo` |
-| `PORT` | MCP HTTP listen port | `8080` in Docker/Compose, `8000` when run directly |
+| `DAV_URL` | Radicale base URL reachable by the sidecar | `http://radicale:5232/` |
+| `DAV_USERNAME` | Existing Radicale user | Required |
+| `DAV_PASSWORD` | Password for that Radicale user | Required |
+| `MCP_TOKEN` | Bearer token protecting `/mcp` | Required |
+| `MCP_TIMEZONE` | IANA timezone used for naive date-times | Image default: `America/Sao_Paulo`; set explicitly for your deployment |
+| `PORT` | Internal MCP HTTP port | `8080` in the reference Compose |
 
-`GET /health` is public and returns 200 only when a DAV PROPFIND succeeds with the configured credentials. It returns 503 without revealing DAV data when Radicale is unavailable. Every other MCP request requires `Authorization: Bearer <MCP_TOKEN>`. The adapter listens on `0.0.0.0` inside its container. The example uses only `expose: ["8080"]` with `PORT: "8080"`; it does not publish an MCP port on the host. Connect Coolify/Traefik or the existing HTTPS reverse proxy to the same Docker network and route to `radicale-mcp:8080` (`/mcp` for MCP clients).
+The sidecar uses the rights already granted to `DAV_USERNAME`. It does not create Radicale users or collections.
 
-Accounts, calendars, task lists, and address books are managed by Radicale and DAV clients. MCP does not create users or collections. Existing data is immediately available through DAV according to that user's rights. A calendar supporting both VEVENT and VTODO appears in both `list_calendars` and `list_task_lists`.
+## Health checks
 
-Outside Docker, `python -m radicale_mcp.server` starts only MCP using the same six environment variables. The ASGI entry point is `radicale_mcp.server:app`.
+`GET /health` is intentionally public and lightweight. It returns HTTP 200 only when the MCP process can successfully authenticate to the configured Radicale server with a DAV `PROPFIND`. If Radicale is unavailable or the configured DAV credentials fail, it returns HTTP 503.
 
-## Tools and IDs
+That makes the MCP health endpoint a functional end-to-end readiness check for the adapter plus its Radicale dependency.
 
-Collections and items use the DAV href relative to `DAV_URL` as their `id`, for example `alice/work/` and `alice/work/4c1f.ics`. Use IDs returned by the tools. IDs are checked against the configured origin and base path; redirects and escaped paths are rejected.
+The reference Compose also gives Radicale its own local port health check and starts the MCP sidecar only after Radicale becomes healthy.
+
+For Docker Compose platforms such as Coolify, health is still reported per component, while the overall Service/stack status is aggregated from required components. The MCP health check additionally verifies the real DAV dependency, so a healthy MCP means the complete MCP -> Radicale path is working.
+
+## Multiple users
+
+The current design is intentionally simple:
+
+> One MCP instance = one Radicale identity.
+
+Do not share one MCP token between people who should have different Radicale permissions.
+
+For multiple users, run one sidecar per Radicale account:
+
+```text
+Radicale
+├── radicale-mcp-alice  -> DAV user alice
+├── radicale-mcp-bob    -> DAV user bob
+└── radicale-mcp-agent  -> DAV service account
+```
+
+Each sidecar has its own `DAV_USERNAME`, `DAV_PASSWORD` and `MCP_TOKEN`. Radicale remains the source of truth for access control and shared calendars/address books.
+
+## MCP tools
 
 | Resource | Tools |
 | --- | --- |
@@ -55,31 +152,64 @@ Collections and items use the DAV href relative to `DAV_URL` as their `id`, for 
 | Tasks | `list_task_lists`, `list_tasks`, `search_tasks`, `get_task`, `create_task`, `update_task`, `complete_task`, `delete_task` |
 | Contacts | `list_addressbooks`, `list_contacts`, `search_contacts`, `get_contact`, `create_contact`, `update_contact`, `delete_contact` |
 
-For example, call `create_event` with:
+Collection and item IDs are DAV hrefs relative to `DAV_URL`, for example:
 
-```json
-{"calendar_id":"alice/work/","summary":"Review","start":"2026-10-01T09:00:00","end":"2026-10-01T10:00:00"}
+```text
+alice/work/
+alice/work/4c1f.ics
 ```
 
-The result includes `id`, `uid`, and `etag`. Pass that exact ETag to `update_event`:
+Use IDs returned by the tools rather than constructing them manually.
+
+## Dates and concurrency
+
+- Date-times use ISO 8601.
+- Explicit offsets preserve the instant and are normalized safely for iCalendar.
+- Date-only events remain all-day `DATE` values.
+- Recurring resources are returned as series resources; occurrences are not expanded by the MCP layer.
+- Updates and deletes require the current strong ETag.
+- Stale ETags fail instead of silently overwriting a concurrent DAV change.
+
+Example event creation:
 
 ```json
-{"event_id":"alice/work/<id-from-create>.ics","expected_etag":"\"etag-from-create\"","changes":{"summary":"Review moved"}}
+{
+  "calendar_id": "alice/work/",
+  "summary": "Review",
+  "start": "2026-10-01T09:00:00-03:00",
+  "end": "2026-10-01T10:00:00-03:00"
+}
 ```
 
-`update_event`, `update_task`, `update_contact`, `complete_task`, and all deletes require a current single strong ETag. A concurrent DAV change causes HTTP 412 and the tool call fails; get the item again before retrying. `changes` modifies only named fields. An omitted field stays as it was; `null` clears an optional field. UID is never changed by updates. Create uses `If-None-Match: *`, while updates and deletes use `If-Match`.
+## Security model
 
-`get_event` and `get_task` return `raw_ical`; `get_contact` returns `raw_vcard`. Event patches target the master VEVENT and preserve recurrence overrides, alarms, VTIMEZONE, RRULE, EXDATE, and unrecognized properties. Searches and date filters use DAV REPORT. A recurring event or task is returned as a matching **series resource**, not an expanded list of occurrences; `recurrence_overrides` reports how many override VEVENTs are present. List tools return up to 100 items by default and accept `limit` up to 1000. Search tools filter the full REPORT result before applying the limit.
+- `/mcp` requires `Authorization: Bearer <MCP_TOKEN>`.
+- DAV credentials stay inside the sidecar environment.
+- Credentials and tokens are not returned by MCP tools.
+- Clients cannot supply arbitrary DAV server URLs.
+- Redirects and path traversal are rejected.
+- The reference container runs as a non-root user with a read-only filesystem and dropped Linux capabilities.
 
-Date-only events keep all-day `DATE` values and an exclusive end date. A date-time without an offset uses `MCP_TIMEZONE`. An explicit ISO offset is normalized to UTC to preserve its instant in iCalendar; existing TZID and floating date-times remain intact when patched with offset-free values. Contacts support name, company, title, multiple emails and phones, and multiline notes. Other vCard fields remain when omitted from an update.
+For internet-facing deployments, terminate TLS at a trusted reverse proxy.
 
-## Build and verification
-
-Run development checks only in an execution environment authorized for the project:
+## Development
 
 ```sh
+python -m pip install .
 python -m unittest discover -s tests -v
-docker build -t ghcr.io/forge-z/radicale-mcp:latest .
+docker build -t radicale-mcp:dev .
 ```
 
-The sidecar integration suite uses separate Radicale and MCP containers with temporary test resources. The manual GitHub Actions workflow builds and tests natively on AMD64 and ARM64, then combines the tested image digests into the commit and `latest` multiarch tags. These commands describe the verification procedure; they do not imply a successful run or a published image for a particular commit. Check the CI results and image tag for the commit being deployed.
+The integration suite runs a real Radicale container separately from the MCP container and verifies that the MCP sidecar has no Radicale storage mounts.
+
+GitHub Actions builds and tests natively on both AMD64 and ARM64 before publishing the multiarch image.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+Radicale is a separate project with its own license and is not bundled into the `radicale-mcp` image.
