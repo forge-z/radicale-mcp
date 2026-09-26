@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "radicale-mcp"
+version = "0.1.0"
+description = "MCP tools for a Radicale CalDAV/CardDAV server"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp==2.2.0",
+  "httpx==0.28.1",
+  "icalendar==6.3.2",
+  "vobject==0.9.9",
+]
+
+[project.scripts]
+radicale-mcp = "radicale_mcp.server:main"
+
+[tool.setuptools.packages.find]
+include = ["radicale_mcp*"]

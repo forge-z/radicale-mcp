@@ -1,0 +1,36 @@
+services:
+  radicale-mcp:
+    build: .
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${RADICALE_BIND_ADDRESS:-127.0.0.1}:${RADICALE_PUBLISHED_PORT:-5232}:5232"
+      - "${MCP_BIND_ADDRESS:-127.0.0.1}:${MCP_PUBLISHED_PORT:-8080}:${PORT:-8080}"
+    environment:
+      DAV_URL: http://127.0.0.1:5232/
+      DAV_USERNAME: ${DAV_USERNAME:?Defina DAV_USERNAME no ambiente}
+      DAV_PASSWORD: ${DAV_PASSWORD:?Defina DAV_PASSWORD no ambiente}
+      MCP_TOKEN: ${MCP_TOKEN:?Defina MCP_TOKEN no ambiente}
+      MCP_TIMEZONE: ${MCP_TIMEZONE:-America/Sao_Paulo}
+      PORT: ${PORT:-8080}
+    volumes:
+      - "${RADICALE_CONFIG_FILE:-./docker/radicale/config}:/etc/radicale/config:ro"
+      - "${RADICALE_USERS_FILE:-./docker/radicale/empty-users}:/etc/radicale/users:ro"
+      - radicale-data:/var/lib/radicale
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:' + __import__('os').environ.get('PORT', '8080') + '/health', timeout=2)"]
+      interval: 30s
+      timeout: 3s
+      start_period: 15s
+      retries: 3
+
+volumes:
+  radicale-data:
+    name: ${RADICALE_VOLUME:-radicale-mcp-data}
