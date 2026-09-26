@@ -23,10 +23,10 @@ Once the configured MCP image tag is available, start only the sidecar:
 ```sh
 docker compose up -d --no-deps radicale-mcp
 docker compose ps radicale-mcp
-curl -fsS http://127.0.0.1:8080/health
+docker compose exec -T radicale-mcp python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"
 ```
 
-Adding MCP does not require recreating or migrating volumes, changing Radicale configuration, or restarting Radicale. Avoid a stack-wide `up`, `down`, or volume operation for this addition. The example consumes `ghcr.io/forge-z/radicale-mcp:latest`; that tag must be built and published before it can be pulled. It is also possible to build the source with that tag in an authorized development environment.
+Adding MCP does not require recreating or migrating volumes, changing Radicale configuration, or restarting Radicale. Avoid a stack-wide `up`, `down`, or volume operation for this addition. The example consumes `ghcr.io/forge-z/radicale-mcp:latest`, a multiarch image for `linux/amd64` and `linux/arm64`; Docker selects the native architecture automatically. It is also possible to build the source with that tag in an authorized development environment.
 
 ## Configuration
 
@@ -39,7 +39,7 @@ Adding MCP does not require recreating or migrating volumes, changing Radicale c
 | `MCP_TIMEZONE` | IANA zone for new date-times without an offset | `America/Sao_Paulo` |
 | `PORT` | MCP HTTP listen port | `8080` in Docker/Compose, `8000` when run directly |
 
-`GET /health` is public and returns 200 only when a DAV PROPFIND succeeds with the configured credentials. It returns 503 without revealing DAV data when Radicale is unavailable. Every other MCP request requires `Authorization: Bearer <MCP_TOKEN>`. The adapter listens on `0.0.0.0` inside its container; the example publishes only its port on host loopback (`127.0.0.1:8080:8080`). The supplied Compose fixes both MCP ports at 8080; change the environment and mapping together if customizing them. Use the existing HTTPS reverse proxy for remote MCP clients.
+`GET /health` is public and returns 200 only when a DAV PROPFIND succeeds with the configured credentials. It returns 503 without revealing DAV data when Radicale is unavailable. Every other MCP request requires `Authorization: Bearer <MCP_TOKEN>`. The adapter listens on `0.0.0.0` inside its container. The example uses only `expose: ["8080"]` with `PORT: "8080"`; it does not publish an MCP port on the host. Connect Coolify/Traefik or the existing HTTPS reverse proxy to the same Docker network and route to `radicale-mcp:8080` (`/mcp` for MCP clients).
 
 Accounts, calendars, task lists, and address books are managed by Radicale and DAV clients. MCP does not create users or collections. Existing data is immediately available through DAV according to that user's rights. A calendar supporting both VEVENT and VTODO appears in both `list_calendars` and `list_task_lists`.
 
@@ -82,4 +82,4 @@ python -m unittest discover -s tests -v
 docker build -t ghcr.io/forge-z/radicale-mcp:latest .
 ```
 
-The sidecar integration suite uses separate Radicale and MCP containers with temporary test resources. These commands describe the verification procedure; they do not imply a successful run or a published image for a particular commit. Check the CI results and image tag for the commit being deployed.
+The sidecar integration suite uses separate Radicale and MCP containers with temporary test resources. The manual GitHub Actions workflow builds and tests natively on AMD64 and ARM64, then combines the tested image digests into the commit and `latest` multiarch tags. These commands describe the verification procedure; they do not imply a successful run or a published image for a particular commit. Check the CI results and image tag for the commit being deployed.

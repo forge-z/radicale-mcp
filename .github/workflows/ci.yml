@@ -7,15 +7,29 @@ concurrency:
   group: image-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  IMAGE: ghcr.io/forge-z/radicale-mcp
+
 jobs:
   test-and-publish:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     permissions:
       contents: read
       packages: write
     env:
-      IMAGE: ghcr.io/forge-z/radicale-mcp
+      ARCH: ${{ matrix.arch }}
+    outputs:
+      amd64_digest: ${{ steps.publish.outputs.amd64_digest }}
+      arm64_digest: ${{ steps.publish.outputs.arm64_digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -23,6 +37,7 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - name: Install test dependencies
         run: python -m pip install .
       - name: Validate Compose example
@@ -30,32 +45,72 @@ jobs:
           DAV_USERNAME: test-user
           DAV_PASSWORD: test-password
           MCP_TOKEN: test-token
-        run: docker compose config --quiet
+        run: |
+          docker compose config --quiet
+          docker compose config --format json | jq -e '
+            .services["radicale-mcp"] |
+            .expose == ["8080"] and .environment.PORT == "8080" and
+            .environment.DAV_URL == "http://radicale:5232/" and
+            ((.ports // []) | length == 0) and
+            ((.volumes // []) | length == 0) and (has("platform") | not)'
       - name: Build MCP image
         id: build
         run: |
-          docker build --pull --no-cache --tag "$IMAGE:$GITHUB_SHA" --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" --label "org.opencontainers.image.revision=$GITHUB_SHA" .
-          echo "image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE:$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
+          docker buildx build --platform "linux/$ARCH" --load --pull --no-cache --tag "$IMAGE:$GITHUB_SHA-$ARCH" --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" --label "org.opencontainers.image.revision=$GITHUB_SHA" .
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE:$GITHUB_SHA-$ARCH")" = "linux/$ARCH"
+          echo "image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE:$GITHUB_SHA-$ARCH")" >> "$GITHUB_OUTPUT"
       - name: Test the built image against a separate Radicale
         env:
-          RADICALE_MCP_TEST_IMAGE: ghcr.io/forge-z/radicale-mcp:${{ github.sha }}
+          RADICALE_MCP_TEST_IMAGE: ghcr.io/forge-z/radicale-mcp:${{ github.sha }}-${{ matrix.arch }}
         run: python -m unittest discover -s tests -v
       - name: Publish the tested image
+        id: publish
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TESTED_IMAGE_ID: ${{ steps.build.outputs.image_id }}
         run: |
-          test "$(docker image inspect --format '{{.Id}}' "$IMAGE:$GITHUB_SHA")" = "$TESTED_IMAGE_ID"
+          test "$(docker image inspect --format '{{.Id}}' "$IMAGE:$GITHUB_SHA-$ARCH")" = "$TESTED_IMAGE_ID"
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          docker push "$IMAGE:$GITHUB_SHA"
-          docker tag "$IMAGE:$GITHUB_SHA" "$IMAGE:latest"
-          docker push "$IMAGE:latest"
+          docker push "$IMAGE:$GITHUB_SHA-$ARCH"
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$GITHUB_SHA-$ARCH")
+          echo "${ARCH}_digest=${digest#*@}" >> "$GITHUB_OUTPUT"
           {
             echo "Commit: $GITHUB_SHA"
+            echo "Platform: linux/$ARCH"
             echo "Tested image: $TESTED_IMAGE_ID"
-            docker image inspect --format 'Published digest: {{index .RepoDigests 0}}' "$IMAGE:$GITHUB_SHA"
+            echo "Published image: $digest"
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Log out of the registry
+        if: always()
+        run: docker logout ghcr.io
+
+  publish-multiarch:
+    needs: test-and-publish
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Publish and verify multiarch manifests
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AMD64_DIGEST: ${{ needs.test-and-publish.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ needs.test-and-publish.outputs.arm64_digest }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker buildx imagetools create --tag "$IMAGE:$GITHUB_SHA" --tag "$IMAGE:latest" "$IMAGE@$AMD64_DIGEST" "$IMAGE@$ARM64_DIGEST"
+          for tag in "$GITHUB_SHA" latest; do
+            docker buildx imagetools inspect --raw "$IMAGE:$tag" | jq -e --arg amd64 "$AMD64_DIGEST" --arg arm64 "$ARM64_DIGEST" '
+              [.manifests[] | {platform: (.platform.os + "/" + .platform.architecture), digest}] | sort_by(.platform) ==
+              [{platform: "linux/amd64", digest: $amd64}, {platform: "linux/arm64", digest: $arm64}]'
+          done
+          {
+            echo "Commit: $GITHUB_SHA"
+            docker buildx imagetools inspect "$IMAGE:latest"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Log out of the registry
         if: always()
         run: docker logout ghcr.io
