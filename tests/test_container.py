@@ -12,7 +12,6 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
-from urllib.parse import quote
 
 import httpx2 as httpx
 from mcp import Client
@@ -44,9 +43,13 @@ class ContainerIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.suffix = secrets.token_hex(5)
-        cls.image = f"radicale-mcp-test:{cls.suffix}"
+        cls.upstream_image = "ghcr.io/kozea/radicale:stable"
+        cls.image = os.environ.get("RADICALE_MCP_TEST_IMAGE", "").strip() or None
+        cls.image_built = False
+        cls.radicale_container = f"radicale-sidecar-test-{cls.suffix}"
         cls.container = f"radicale-mcp-test-{cls.suffix}"
-        cls.volume = f"radicale-mcp-test-{cls.suffix}"
+        cls.network = f"radicale-mcp-net-{cls.suffix}"
+        cls.volume = f"radicale-data-test-{cls.suffix}"
         cls.username = f"mcp-test-{cls.suffix}"
         cls.password = secrets.token_urlsafe(24)
         cls.token = secrets.token_urlsafe(32)
@@ -55,45 +58,72 @@ class ContainerIntegration(unittest.TestCase):
         cls.config_dir = Path(cls.tmp.name)
         cls.config_file = cls.config_dir / "config"
         cls.users_file = cls.config_dir / "users"
-        cls.started = False
-        cls.image_built = False
         try:
-            subprocess.run(["docker", "build", "--tag", cls.image, "."], cwd=ROOT, check=True)
-            cls.image_built = True
+            cls.command(["docker", "pull", cls.upstream_image])
+            if cls.image is None:
+                cls.image = f"radicale-mcp-test:{cls.suffix}"
+                cls.command(["docker", "build", "--tag", cls.image, "."], cwd=ROOT)
+                cls.image_built = True
+            else:
+                cls.command(["docker", "image", "inspect", cls.image])
+
             hash_process = subprocess.run(
-                ["docker", "run", "--rm", "-i", "--entrypoint", "python", cls.image, "-c",
-                 "import bcrypt,sys; print(bcrypt.hashpw(sys.stdin.buffer.readline().rstrip(b'\\n'), bcrypt.gensalt()).decode())"],
-                input=cls.password + "\n", text=True, capture_output=True, check=True,
+                ["docker", "run", "--rm", "-i", "--entrypoint", "htpasswd",
+                 cls.upstream_image, "-niB", cls.username],
+                input=cls.password + "\n", text=True, capture_output=True,
             )
-            password_hash = hash_process.stdout.strip().splitlines()[-1]
-            cls.users_file.write_text(f"{cls.username}:{password_hash}\n", encoding="utf-8")
-            cls.config_file.write_text((ROOT / "docker/radicale/config").read_text(encoding="utf-8"), encoding="utf-8")
-            subprocess.run(["docker", "volume", "create", cls.volume], check=True, capture_output=True, text=True)
-            subprocess.run([
-                "docker", "run", "-d", "--name", cls.container, "--read-only",
-                "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m", "--cap-drop", "ALL",
-                "--security-opt", "no-new-privileges:true",
+            if hash_process.returncode != 0 or not hash_process.stdout.strip():
+                raise AssertionError("Could not generate the temporary Radicale htpasswd fixture")
+            cls.users_file.write_text(hash_process.stdout, encoding="utf-8")
+            cls.config_file.write_text(
+                "[server]\nhosts = 0.0.0.0:5232\n\n"
+                "[auth]\ntype = htpasswd\nhtpasswd_filename = /etc/radicale/users\n"
+                "htpasswd_encryption = bcrypt\n\n"
+                "[rights]\ntype = owner_only\n\n"
+                "[storage]\nfilesystem_folder = /var/lib/radicale/collections\n"
+                "strict_preconditions = True\n\n[web]\ntype = internal\n",
+                encoding="utf-8",
+            )
+            os.chmod(cls.config_dir, 0o755)
+            os.chmod(cls.config_file, 0o644)
+            os.chmod(cls.users_file, 0o644)
+            cls.command(["docker", "network", "create", cls.network])
+            cls.command(["docker", "volume", "create", cls.volume])
+            cls.command([
+                "docker", "run", "-d", "--name", cls.radicale_container,
+                "--network", cls.network, "--network-alias", "radicale",
+                "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m",
+                "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
                 "-p", f"127.0.0.1:{cls.radicale_port}:5232",
-                "-p", f"127.0.0.1:{cls.mcp_port}:8080",
-                "-e", "DAV_URL=http://127.0.0.1:5232/",
-                "-e", f"DAV_USERNAME={cls.username}", "-e", f"DAV_PASSWORD={cls.password}",
-                "-e", f"MCP_TOKEN={cls.token}", "-e", "MCP_TIMEZONE=America/Sao_Paulo", "-e", "PORT=8080",
                 "-v", f"{cls.config_file}:/etc/radicale/config:ro",
                 "-v", f"{cls.users_file}:/etc/radicale/users:ro",
                 "-v", f"{cls.volume}:/var/lib/radicale",
-                cls.image,
-            ], check=True, capture_output=True, text=True)
-            cls.started = True
-            cls.wait_healthy()
+                cls.upstream_image,
+            ])
+            cls.wait_radicale_healthy()
         except BaseException:
             cls.cleanup()
             raise
 
+    @staticmethod
+    def command(args, *, input=None, env=None, cwd=None):
+        result = subprocess.run(
+            args, input=input, text=True, capture_output=True, env=env, cwd=cwd,
+        )
+        if result.returncode != 0:
+            raise AssertionError(f"Docker test command failed (exit {result.returncode})")
+        return result.stdout
+
     @classmethod
     def cleanup(cls):
-        subprocess.run(["docker", "rm", "-f", cls.container], capture_output=True, text=True)
-        subprocess.run(["docker", "volume", "rm", "-f", cls.volume], capture_output=True, text=True)
-        if cls.image_built:
+        for name in (getattr(cls, "container", None), getattr(cls, "radicale_container", None)):
+            if name:
+                subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
+        if getattr(cls, "network", None):
+            subprocess.run(["docker", "network", "rm", cls.network], capture_output=True, text=True)
+        if getattr(cls, "volume", None):
+            subprocess.run(["docker", "volume", "rm", "-f", cls.volume], capture_output=True, text=True)
+        if getattr(cls, "image_built", False) and getattr(cls, "image", None):
             subprocess.run(["docker", "image", "rm", "-f", cls.image], capture_output=True, text=True)
         if hasattr(cls, "tmp"):
             cls.tmp.cleanup()
@@ -102,36 +132,135 @@ class ContainerIntegration(unittest.TestCase):
     def tearDownClass(cls):
         cls.cleanup()
 
+    @staticmethod
+    def http_request(method, url, body=None, headers=None):
+        request = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, response.headers, response.read().decode(errors="replace")
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.code, exc.headers, exc.read().decode(errors="replace")
+
+    @classmethod
+    def wait_radicale_healthy(cls):
+        auth = base64.b64encode(f"{cls.username}:{cls.password}".encode()).decode()
+        headers = {"Authorization": f"Basic {auth}", "Depth": "0", "Content-Type": "application/xml"}
+        deadline = time.monotonic() + 60
+        last_status = None
+        while time.monotonic() < deadline:
+            try:
+                status, _, _ = cls.http_request(
+                    "PROPFIND", f"http://127.0.0.1:{cls.radicale_port}/", headers=headers,
+                )
+                if status == 207:
+                    return
+                last_status = status
+            except Exception as exc:
+                last_status = type(exc).__name__
+            time.sleep(0.5)
+        raise AssertionError(f"Radicale fixture did not become ready (last={last_status})")
+
     @classmethod
     def wait_healthy(cls):
         url = f"http://127.0.0.1:{cls.mcp_port}/health"
-        deadline = time.monotonic() + 90
-        last_error = None
+        deadline = time.monotonic() + 60
+        last_status = None
         while time.monotonic() < deadline:
             try:
-                with urllib.request.urlopen(url, timeout=2) as response:
-                    if response.status == 200:
-                        return
-                    last_error = f"HTTP {response.status}"
+                status, _, _ = cls.http_request("GET", url)
+                if status == 200:
+                    return
+                last_status = status
             except Exception as exc:
-                last_error = str(exc)
-            time.sleep(1)
-        logs = subprocess.run(["docker", "logs", cls.container], capture_output=True, text=True).stdout
-        raise AssertionError(f"container health did not become ready ({last_error}); logs:\n{logs[-6000:]}")
+                last_status = type(exc).__name__
+            time.sleep(0.5)
+        raise AssertionError(f"MCP health did not become ready (last={last_status})")
+
+    def wait_http_status(self, url, expected, timeout=20):
+        deadline = time.monotonic() + timeout
+        last_status = None
+        while time.monotonic() < deadline:
+            try:
+                last_status, _, _ = self.http_request("GET", url)
+                if last_status == expected:
+                    return
+            except Exception as exc:
+                last_status = type(exc).__name__
+            time.sleep(0.5)
+        self.fail(f"HTTP endpoint did not return {expected} (last={last_status})")
+
+    def start_mcp(self):
+        child_env = os.environ.copy()
+        child_env.update({
+            "DAV_USERNAME": self.username,
+            "DAV_PASSWORD": self.password,
+            "MCP_TOKEN": self.token,
+        })
+        self.command([
+            "docker", "run", "-d", "--name", self.container,
+            "--network", self.network, "--network-alias", "radicale-mcp",
+            "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=16m",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+            "-p", f"127.0.0.1:{self.mcp_port}:8080",
+            "-e", "DAV_URL=http://radicale:5232/",
+            "-e", "DAV_USERNAME", "-e", "DAV_PASSWORD", "-e", "MCP_TOKEN",
+            "-e", "MCP_TIMEZONE=America/Sao_Paulo", "-e", "PORT=8080",
+            "--pull=never", self.image,
+        ], env=child_env)
+        self.wait_healthy()
+        self.assert_mcp_is_sidecar()
+
+    def assert_mcp_is_sidecar(self):
+        mounts = json.loads(self.command([
+            "docker", "inspect", "--format", "{{json .Mounts}}", self.container,
+        ]))
+        self.assertTrue(
+            all(mount.get("Type") == "tmpfs" and mount.get("Destination") == "/tmp" for mount in mounts),
+            "MCP may have only its own /tmp tmpfs mount",
+        )
+        radicale_mounts = json.loads(self.command([
+            "docker", "inspect", "--format", "{{json .Mounts}}", self.radicale_container,
+        ]))
+        radicale_destinations = {mount.get("Destination"): mount for mount in radicale_mounts}
+        required_radicale_mounts = {"/etc/radicale/config", "/etc/radicale/users", "/var/lib/radicale"}
+        self.assertTrue(required_radicale_mounts.issubset(radicale_destinations))
+        self.assertLessEqual(set(radicale_destinations), required_radicale_mounts | {"/tmp"})
+        if "/tmp" in radicale_destinations:
+            self.assertEqual(radicale_destinations["/tmp"].get("Type"), "tmpfs")
+        self.assertEqual(radicale_destinations["/etc/radicale/config"].get("Type"), "bind")
+        self.assertEqual(radicale_destinations["/etc/radicale/users"].get("Type"), "bind")
+        self.assertEqual(radicale_destinations["/var/lib/radicale"].get("Type"), "volume")
+        self.assertEqual(radicale_destinations["/var/lib/radicale"].get("Name"), self.volume)
+        exposed = json.loads(self.command([
+            "docker", "inspect", "--format", "{{json .Config.ExposedPorts}}", self.container,
+        ]) or "null") or {}
+        self.assertNotIn("5232/tcp", exposed)
+        probe = (
+            "import importlib.util,os,shutil,sys;"
+            "bad=(importlib.util.find_spec('radicale') is not None or "
+            "shutil.which('radicale') is not None or "
+            "os.path.exists('/etc/radicale/config') or "
+            "os.path.exists('/var/lib/radicale'));"
+            "sys.exit(1 if bad else 0)"
+        )
+        self.command(["docker", "exec", self.container, "python", "-c", probe])
+
+    @classmethod
+    def assert_radicale_running(cls):
+        state = cls.command([
+            "docker", "inspect", "--format", "{{.State.Running}}", cls.radicale_container,
+        ]).strip()
+        if state != "true":
+            raise AssertionError("The independent Radicale container is not running")
 
     def dav(self, method, path, body=None, headers=None):
         auth = base64.b64encode(f"{self.username}:{self.password}".encode()).decode()
         request_headers = {"Authorization": f"Basic {auth}"}
         request_headers.update(headers or {})
-        request = urllib.request.Request(
-            f"http://127.0.0.1:{self.radicale_port}/{path}", data=body, headers=request_headers, method=method,
+        return self.http_request(
+            method, f"http://127.0.0.1:{self.radicale_port}/{path}", body, request_headers,
         )
-        try:
-            response = urllib.request.urlopen(request, timeout=10)
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.headers, exc.read().decode(errors="replace")
-        with response:
-            return response.status, response.headers, response.read().decode(errors="replace")
 
     def create_calendar(self, name, component):
         calendar_id = f"{self.username}/{name}/"
@@ -142,11 +271,11 @@ class ContainerIntegration(unittest.TestCase):
             f'<c:supported-calendar-component-set><c:comp name="{component}"/></c:supported-calendar-component-set>'
             '</d:prop></d:set></c:mkcalendar>'
         ).encode()
-        status, _, response = self.dav(
+        status, _, _ = self.dav(
             "MKCALENDAR", calendar_id, body,
             {"Content-Type": "application/xml; charset=utf-8"},
         )
-        self.assertIn(status, (200, 201, 204), response)
+        self.assertIn(status, (200, 201, 204), f"Could not create {component} collection (HTTP {status})")
         return calendar_id
 
     def create_addressbook(self, name):
@@ -157,11 +286,11 @@ class ContainerIntegration(unittest.TestCase):
             '<d:set><d:prop><d:resourcetype><d:collection/><card:addressbook/></d:resourcetype>'
             '<d:displayname>Integration</d:displayname></d:prop></d:set></d:mkcol>'
         ).encode()
-        status, _, response = self.dav(
+        status, _, _ = self.dav(
             "MKCOL", addressbook_id, body,
             {"Content-Type": "application/xml; charset=utf-8"},
         )
-        self.assertIn(status, (200, 201, 204), response)
+        self.assertIn(status, (200, 201, 204), f"Could not create addressbook (HTTP {status})")
         return addressbook_id
 
     @staticmethod
@@ -187,18 +316,67 @@ class ContainerIntegration(unittest.TestCase):
                 "clientInfo": {"name": "auth-check", "version": "1"},
             },
         }).encode()
-        request = urllib.request.Request(
-            f"http://127.0.0.1:{self.mcp_port}/mcp", data=payload,
-            headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream", **headers},
+        status, _, _ = self.http_request(
+            "POST", f"http://127.0.0.1:{self.mcp_port}/mcp", payload,
+            {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", **headers},
         )
-        try:
-            response = urllib.request.urlopen(request, timeout=5)
-        except urllib.error.HTTPError as exc:
-            return exc.code
-        with response:
-            return response.status
+        return status
 
     def test_container_contract(self):
+
+        calendar_id = self.create_calendar(f"events-{self.suffix}", "VEVENT")
+        task_list_id = self.create_calendar(f"tasks-{self.suffix}", "VTODO")
+        addressbook_id = self.create_addressbook(f"contacts-{self.suffix}")
+
+        self.seed_event_uid = f"seed-event-{self.suffix}"
+        self.seed_task_uid = f"seed-task-{self.suffix}"
+        self.seed_contact_uid = f"seed-contact-{self.suffix}"
+        self.seed_event_id = calendar_id + "dav-seed-event.ics"
+        self.seed_task_id = task_list_id + "dav-seed-task.ics"
+        self.seed_contact_id = addressbook_id + "dav-seed-contact.vcf"
+        seed_event = f"""BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//sidecar-test//EN
+BEGIN:VEVENT
+UID:{self.seed_event_uid}
+DTSTAMP:20260926T000000Z
+DTSTART:20261002T120000Z
+DTEND:20261002T130000Z
+SUMMARY:Seeded directly through DAV
+END:VEVENT
+END:VCALENDAR
+"""
+        seed_task = f"""BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//sidecar-test//EN
+BEGIN:VTODO
+UID:{self.seed_task_uid}
+DTSTAMP:20260926T000000Z
+DTSTART;VALUE=DATE:20261003
+DUE;VALUE=DATE:20261010
+SUMMARY:Seeded task directly through DAV
+END:VTODO
+END:VCALENDAR
+"""
+        seed_contact = f"""BEGIN:VCARD
+VERSION:3.0
+UID:{self.seed_contact_uid}
+FN:Seeded contact
+EMAIL:seed@example.test
+END:VCARD
+"""
+        for item_id, value, content_type in (
+            (self.seed_event_id, seed_event, "text/calendar; charset=utf-8"),
+            (self.seed_task_id, seed_task, "text/calendar; charset=utf-8"),
+            (self.seed_contact_id, seed_contact, "text/vcard; charset=utf-8"),
+        ):
+            status, _, _ = self.dav(
+                "PUT", item_id, value.encode(),
+                {"Content-Type": content_type, "If-None-Match": "*"},
+            )
+            self.assertIn(status, (200, 201, 204), f"Could not seed DAV item (HTTP {status})")
+
+        self.start_mcp()
         self.assertEqual(self.request_unauthorized({}), 401)
         self.assertEqual(self.request_unauthorized({"Authorization": "Bearer invalid"}), 401)
         self.assertEqual(self.request_unauthorized({"Authorization": f"Bearer {self.token}é"}), 401)
@@ -207,12 +385,7 @@ class ContainerIntegration(unittest.TestCase):
         status, _, page = self.dav("GET", "")
         self.assertEqual(status, 200, page)
         self.assertTrue("radicale" in page.casefold() or "<html" in page.casefold(), page[:300])
-
-        calendar_id = self.create_calendar(f"events-{self.suffix}", "VEVENT")
-        task_list_id = self.create_calendar(f"tasks-{self.suffix}", "VTODO")
-        addressbook_id = self.create_addressbook(f"contacts-{self.suffix}")
-        username, password, token = self.username, self.password, self.token
-        radicale_port = self.radicale_port
+        token = self.token
 
         async def exercise():
             ids = {}
@@ -236,6 +409,15 @@ class ContainerIntegration(unittest.TestCase):
                         self.assertTrue(any(row["id"] == calendar_id for row in calendars), repr(calendars))
                         self.assertTrue(any(row["id"] == task_list_id for row in task_lists))
                         self.assertTrue(any(row["id"] == addressbook_id for row in books))
+                        seed_event = await call("get_event", {"event_id": self.seed_event_id})
+                        seed_task = await call("get_task", {"task_id": self.seed_task_id})
+                        seed_contact = await call("get_contact", {"contact_id": self.seed_contact_id})
+                        self.assertEqual(seed_event["uid"], self.seed_event_uid)
+                        self.assertEqual(seed_task["uid"], self.seed_task_uid)
+                        self.assertEqual(seed_contact["uid"], self.seed_contact_uid)
+                        ids["seed_event"] = self.seed_event_id
+                        ids["seed_task"] = self.seed_task_id
+                        ids["seed_contact"] = self.seed_contact_id
 
                         event = await call("create_event", {
                             "calendar_id": calendar_id, "summary": "Reunião de integração",
@@ -446,7 +628,20 @@ END:VCARD
                         return ids
 
         ids = asyncio.run(exercise())
+        subprocess.run(["docker", "stop", self.radicale_container], check=True, capture_output=True, text=True)
+        self.wait_http_status(f"http://127.0.0.1:{self.mcp_port}/health", 503)
+        self.assertEqual(
+            self.command(["docker", "inspect", "--format", "{{.State.Running}}", self.container]).strip(),
+            "true",
+        )
+        subprocess.run(["docker", "start", self.radicale_container], check=True, capture_output=True, text=True)
+        self.wait_radicale_healthy()
+        self.wait_healthy()
         subprocess.run(["docker", "restart", self.container], check=True, capture_output=True, text=True)
+        self.wait_healthy()
+        self.assert_radicale_running()
+        subprocess.run(["docker", "restart", self.radicale_container], check=True, capture_output=True, text=True)
+        self.wait_radicale_healthy()
         self.wait_healthy()
 
         async def persistence():
@@ -462,12 +657,18 @@ END:VCARD
                             ("persistent_event", "get_event", {"event_id": ids["persistent_event"]}),
                             ("task", "get_task", {"task_id": ids["task"]}),
                             ("external_contact", "get_contact", {"contact_id": ids["external_contact"]}),
+                            ("seed_event", "get_event", {"event_id": ids["seed_event"]}),
+                            ("seed_task", "get_task", {"task_id": ids["seed_task"]}),
+                            ("seed_contact", "get_contact", {"contact_id": ids["seed_contact"]}),
                         ):
                             result = await client.call_tool(name, args)
                             value = self.value(result)
                             self.assertNotIn("__error__", value, value)
                             self.assertTrue(value["etag"])
                             ids[key] = value
+                        self.assertEqual(ids["seed_event"]["uid"], self.seed_event_uid)
+                        self.assertEqual(ids["seed_task"]["uid"], self.seed_task_uid)
+                        self.assertEqual(ids["seed_contact"]["uid"], self.seed_contact_uid)
                         all_day = ids["persistent_event"]
                         self.assertEqual(all_day["start"], "2026-10-20")
                         self.assertEqual(all_day["end"], "2026-10-21")
@@ -476,6 +677,9 @@ END:VCARD
                             ("delete_event", "persistent_event", "event_id"),
                             ("delete_task", "task", "task_id"),
                             ("delete_contact", "external_contact", "contact_id"),
+                            ("delete_event", "seed_event", "event_id"),
+                            ("delete_task", "seed_task", "task_id"),
+                            ("delete_contact", "seed_contact", "contact_id"),
                         ):
                             value = ids[id_key]
                             deleted = await client.call_tool(tool, {

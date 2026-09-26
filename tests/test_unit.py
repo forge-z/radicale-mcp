@@ -106,6 +106,16 @@ class BackendUnit(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dav.kind, "contact")
         return vobject.readOne(dav.saved)
 
+    def test_dav_url_defaults_to_radicale_alias_without_network(self):
+        with patch.dict(
+            os.environ,
+            {"DAV_USERNAME": "fixture-user", "DAV_PASSWORD": "fixture-password"},
+            clear=True,
+        ):
+            dav = Dav()
+        self.assertEqual(dav.base, "http://radicale:5232/")
+        self.assertEqual(dav.origin, ("http", "radicale", 5232))
+
     async def test_event_patch_preserves_series_and_unknown_fields(self):
         cal = await self.event_patch(SERIES, {"summary": "Changed"})
         master = next(part for part in cal.walk("VEVENT") if "RECURRENCE-ID" not in part)
@@ -172,7 +182,7 @@ class BackendUnit(unittest.IsolatedAsyncioTestCase):
         for bad in ("u/../x", "u/%2e%2e/x", "u/%252e%252e/x", "u/%2fadmin", "http://evil/x"):
             with self.assertRaises(ValueError):
                 _path_id(bad)
-        with patch.dict(os.environ, {"DAV_URL": "http://127.0.0.1:5232/base/", "DAV_USERNAME": "user", "DAV_PASSWORD": "password"}):
+        with patch.dict(os.environ, {"DAV_URL": "http://radicale:5232/base/", "DAV_USERNAME": "user", "DAV_PASSWORD": "password"}):
             dav = Dav()
             for bad in ("http://evil/base/item", "/other/item", "http://attacker@127.0.0.1:5232/base/item"):
                 with self.assertRaises(DavError):

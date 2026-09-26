@@ -45,7 +45,7 @@ def _path_id(path: str, *, collection: bool | None = None) -> str:
 
 class Dav:
     def __init__(self) -> None:
-        base = os.getenv("DAV_URL", "http://127.0.0.1:5232/")
+        base = os.getenv("DAV_URL", "http://radicale:5232/")
         parsed = urlsplit(base)
         if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("DAV_URL must be an HTTP(S) base URL without credentials or query")

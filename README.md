@@ -1,43 +1,49 @@
 # Radicale MCP
 
-A thin MCP server for an existing Radicale CalDAV/CardDAV installation. It exposes calendars, tasks, and contacts over Streamable HTTP at `/mcp`. Radicale remains the data store and DAV server; this package reads and writes through DAV, with no separate database or item cache. The supplied image runs Radicale 3.8.0 and the MCP server as two processes in one container.
+A thin MCP sidecar for an existing Radicale CalDAV/CardDAV server. The MCP image runs only the Python adapter and exposes calendars, tasks, and contacts over Streamable HTTP at `/mcp`. Radicale runs separately and owns its configuration, accounts, collections, and storage. The adapter uses authenticated DAV requests and needs no data volume, local database, or item cache.
+
+## Add MCP to an existing Compose stack
+
+Copy only the `radicale-mcp` service from [compose.yaml](compose.yaml) into the existing Compose file and connect it to the same network as Radicale. Keep the existing project/stack name, Radicale service, port, configuration, and volume definitions. The reference file uses `name: radicale`; do not rename an existing deployment to match it.
+
+The complete example retains the upstream image `ghcr.io/kozea/radicale:stable`, its `TZ=America/Sao_Paulo`, port `5232:5232`, and the `config:/etc/radicale` and `data:/var/lib/radicale` mounts. The named bind volumes remain `radicale-config` (`./config`) and `radicale-data` (`./data`). The MCP service has no volumes and does not read those directories.
+
+Set the credentials of an existing Radicale account and a separate MCP token in the deployment environment or an uncommitted `.env`:
+
+```dotenv
+DAV_USERNAME=<existing Radicale username>
+DAV_PASSWORD=<existing Radicale password>
+MCP_TOKEN=<long random token>
+```
+
+`DAV_URL` must use the reachable Radicale service name on that network. The example uses `http://radicale:5232/`. Keep Radicale's existing authentication and rights configuration; the MCP adapter uses the same DAV access granted to that account.
+
+Once the configured MCP image tag is available, start only the sidecar:
+
+```sh
+docker compose up -d --no-deps radicale-mcp
+docker compose ps radicale-mcp
+curl -fsS http://127.0.0.1:8080/health
+```
+
+Adding MCP does not require recreating or migrating volumes, changing Radicale configuration, or restarting Radicale. Avoid a stack-wide `up`, `down`, or volume operation for this addition. The example consumes `ghcr.io/forge-z/radicale-mcp:latest`; that tag must be built and published before it can be pulled. It is also possible to build the source with that tag in an authorized development environment.
 
 ## Configuration
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `DAV_URL` | Radicale HTTP base URL used by MCP | `http://127.0.0.1:5232/` |
+| `DAV_URL` | Radicale HTTP base URL used by MCP | `http://radicale:5232/` |
 | `DAV_USERNAME` | Existing Radicale user for DAV Basic auth | Required |
 | `DAV_PASSWORD` | Password for that user | Required |
 | `MCP_TOKEN` | Single Bearer token for `/mcp`; startup fails if empty | Required |
 | `MCP_TIMEZONE` | IANA zone for new date-times without an offset | `America/Sao_Paulo` |
-| `PORT` | MCP HTTP listen port in the container | `8080` in Docker, `8000` with `python -m radicale_mcp.server` |
+| `PORT` | MCP HTTP listen port | `8080` in Docker/Compose, `8000` when run directly |
 
-`GET /health` is public and returns 200 only when a DAV PROPFIND succeeds with the configured credentials. It returns 503 without revealing DAV data when Radicale is unavailable. Every other MCP request requires `Authorization: Bearer <MCP_TOKEN>`. The MCP server listens on `0.0.0.0` inside the container. Compose publishes both ports on host loopback by default; put an HTTPS reverse proxy in front of `/mcp` for remote clients.
+`GET /health` is public and returns 200 only when a DAV PROPFIND succeeds with the configured credentials. It returns 503 without revealing DAV data when Radicale is unavailable. Every other MCP request requires `Authorization: Bearer <MCP_TOKEN>`. The adapter listens on `0.0.0.0` inside its container; the example publishes only its port on host loopback (`127.0.0.1:8080:8080`). The supplied Compose fixes both MCP ports at 8080; change the environment and mapping together if customizing them. Use the existing HTTPS reverse proxy for remote MCP clients.
 
-The included Radicale config uses its native bcrypt htpasswd authentication and `owner_only` rights. MCP does not create users or collections. Create calendars, task lists, and address books in the Radicale web UI or with a DAV client before using the item tools. The username in `DAV_USERNAME` must be allowed to access those collections. A calendar that supports both VEVENT and VTODO appears in both `list_calendars` and `list_task_lists`.
+Accounts, calendars, task lists, and address books are managed by Radicale and DAV clients. MCP does not create users or collections. Existing data is immediately available through DAV according to that user's rights. A calendar supporting both VEVENT and VTODO appears in both `list_calendars` and `list_task_lists`.
 
-## Run on a Railway development VM
-
-Build the image, create a bcrypt htpasswd entry, and keep the password and token in an uncommitted `.env` on the VM. The hash command prompts for the password, so it need not appear in shell history:
-
-```sh
-docker build -t radicale-mcp:dev .
-docker run --rm -it --entrypoint python radicale-mcp:dev -c 'import bcrypt,getpass; print(bcrypt.hashpw(getpass.getpass("Radicale password: ").encode(), bcrypt.gensalt()).decode())'
-```
-
-Put `username:generated-hash` in a private users file. Set `RADICALE_USERS_FILE` to its absolute path. Add these values to `.env` (use actual secrets, not the placeholders):
-
-```dotenv
-RADICALE_USERS_FILE=/absolute/path/to/private/users
-DAV_USERNAME=username
-DAV_PASSWORD=<same Radicale password>
-MCP_TOKEN=<long random token>
-```
-
-Then run `docker compose up --build -d` in the Railway VM. Check `docker compose ps` and `curl -fsS http://127.0.0.1:8080/health`. The bundled image also exposes Radicale on host loopback port 5232 for its UI and DAV clients. `MCP_BIND_ADDRESS`, `MCP_PUBLISHED_PORT`, `RADICALE_BIND_ADDRESS`, and `RADICALE_PUBLISHED_PORT` can change the host bindings. Do not expose either HTTP port directly to the Internet without a TLS and access-control boundary.
-
-For an already-running Radicale, run only the Python MCP package with `DAV_URL`, `DAV_USERNAME`, `DAV_PASSWORD`, `MCP_TOKEN`, and optionally `PORT`; `python -m radicale_mcp.server` starts the MCP listener. The ASGI entry point is `radicale_mcp.server:app`.
+Outside Docker, `python -m radicale_mcp.server` starts only MCP using the same six environment variables. The ASGI entry point is `radicale_mcp.server:app`.
 
 ## Tools and IDs
 
@@ -67,15 +73,13 @@ The result includes `id`, `uid`, and `etag`. Pass that exact ETag to `update_eve
 
 Date-only events keep all-day `DATE` values and an exclusive end date. A date-time without an offset uses `MCP_TIMEZONE`. An explicit ISO offset is normalized to UTC to preserve its instant in iCalendar; existing TZID and floating date-times remain intact when patched with offset-free values. Contacts support name, company, title, multiple emails and phones, and multiline notes. Other vCard fields remain when omitted from an update.
 
-## Existing data and verification
+## Build and verification
 
-Before replacing a Radicale deployment, back up its collection storage, config, and htpasswd file. Point the new container at the same verified data volume (`RADICALE_VOLUME`) or mount the existing collections directory at `/var/lib/radicale/collections`, and mount the existing Radicale config and users file read-only. Check that UID 10001 can write the storage volume. Keep the original backup until calendars, tasks, contacts, and their UIDs are visible through DAV and MCP after a restart. This package has no schema migration and should not rewrite stored `.ics` or `.vcf` files during transfer.
-
-On the Railway VM, the relevant checks are:
+Run development checks only in an execution environment authorized for the project:
 
 ```sh
-.venv/bin/python -m unittest discover -s tests -v
-docker build -t radicale-mcp:dev .
+python -m unittest discover -s tests -v
+docker build -t ghcr.io/forge-z/radicale-mcp:latest .
 ```
 
-The integration test starts a temporary container and Radicale volume, checks MCP authentication, CRUD, ETag conflicts, DAV persistence after restart, and then removes its test resources. Run it only where Docker execution is permitted.
+The sidecar integration suite uses separate Radicale and MCP containers with temporary test resources. These commands describe the verification procedure; they do not imply a successful run or a published image for a particular commit. Check the CI results and image tag for the commit being deployed.

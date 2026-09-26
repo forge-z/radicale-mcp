@@ -1,13 +1,12 @@
 .venv/
 __pycache__/
 *.py[cod]
+build/
+*.egg-info/
 .env
 .env.*
 !.env.example
-docker/radicale/users
-docker/radicale/htpasswd
-config/radicale/users
-config/radicale/htpasswd
+config/
 data/
 logs/
 *.log

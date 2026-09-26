@@ -1,22 +1,32 @@
+name: radicale
+
 services:
+  radicale:
+    image: ghcr.io/kozea/radicale:stable
+    restart: unless-stopped
+    environment:
+      TZ: America/Sao_Paulo
+    ports:
+      - "5232:5232"
+    volumes:
+      - config:/etc/radicale
+      - data:/var/lib/radicale
+
   radicale-mcp:
-    build: .
+    image: ghcr.io/forge-z/radicale-mcp:latest
     restart: unless-stopped
     init: true
-    ports:
-      - "${RADICALE_BIND_ADDRESS:-127.0.0.1}:${RADICALE_PUBLISHED_PORT:-5232}:5232"
-      - "${MCP_BIND_ADDRESS:-127.0.0.1}:${MCP_PUBLISHED_PORT:-8080}:${PORT:-8080}"
+    depends_on:
+      - radicale
     environment:
-      DAV_URL: http://127.0.0.1:5232/
-      DAV_USERNAME: ${DAV_USERNAME:?Defina DAV_USERNAME no ambiente}
-      DAV_PASSWORD: ${DAV_PASSWORD:?Defina DAV_PASSWORD no ambiente}
-      MCP_TOKEN: ${MCP_TOKEN:?Defina MCP_TOKEN no ambiente}
+      DAV_URL: http://radicale:5232/
+      DAV_USERNAME: ${DAV_USERNAME:?Set DAV_USERNAME}
+      DAV_PASSWORD: ${DAV_PASSWORD:?Set DAV_PASSWORD}
+      MCP_TOKEN: ${MCP_TOKEN:?Set MCP_TOKEN}
       MCP_TIMEZONE: ${MCP_TIMEZONE:-America/Sao_Paulo}
-      PORT: ${PORT:-8080}
-    volumes:
-      - "${RADICALE_CONFIG_FILE:-./docker/radicale/config}:/etc/radicale/config:ro"
-      - "${RADICALE_USERS_FILE:-./docker/radicale/empty-users}:/etc/radicale/users:ro"
-      - radicale-data:/var/lib/radicale
+      PORT: "8080"
+    ports:
+      - "127.0.0.1:8080:8080"
     read_only: true
     tmpfs:
       - /tmp:size=16m
@@ -32,5 +42,17 @@ services:
       retries: 3
 
 volumes:
-  radicale-data:
-    name: ${RADICALE_VOLUME:-radicale-mcp-data}
+  config:
+    name: radicale-config
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./config
+  data:
+    name: radicale-data
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data
