@@ -5,19 +5,27 @@ services:
     image: ghcr.io/kozea/radicale:stable
     restart: unless-stopped
     environment:
-      TZ: America/Sao_Paulo
+      TZ: ${TZ:-America/Sao_Paulo}
     ports:
       - "5232:5232"
     volumes:
       - config:/etc/radicale
       - data:/var/lib/radicale
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',5232),2); s.close()"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
 
   radicale-mcp:
     image: ghcr.io/forge-z/radicale-mcp:latest
+    pull_policy: always
     restart: unless-stopped
     init: true
     depends_on:
-      - radicale
+      radicale:
+        condition: service_healthy
     environment:
       DAV_URL: http://radicale:5232/
       DAV_USERNAME: ${DAV_USERNAME:?Set DAV_USERNAME}
