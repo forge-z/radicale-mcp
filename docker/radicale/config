@@ -1,0 +1,18 @@
+[server]
+hosts = 0.0.0.0:5232
+max_content_length = 10000000
+
+[auth]
+type = htpasswd
+htpasswd_filename = /etc/radicale/users
+htpasswd_encryption = bcrypt
+
+[rights]
+type = owner_only
+
+[storage]
+filesystem_folder = /var/lib/radicale/collections
+strict_preconditions = True
+
+[web]
+type = internal

@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+*.py[cod]
+.env
+.env.*
+!.env.example
+config/
+docker/radicale/users
+docker/radicale/htpasswd
+data/
+logs/
+*.log

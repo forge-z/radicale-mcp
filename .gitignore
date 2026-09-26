@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+docker/radicale/users
+docker/radicale/htpasswd
+config/radicale/users
+config/radicale/htpasswd
+data/
+logs/
+*.log
+.pytest_cache/
